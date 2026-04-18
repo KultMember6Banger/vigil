@@ -22,11 +22,12 @@ classifiers = [
 ]
 dependencies = [
     "chromadb>=0.4.0",
+    "numpy>=1.24.0",
     "sentence-transformers>=2.2.0",
 ]
 
 [project.optional-dependencies]
-nli = ["sentence-transformers>=2.2.0"]
+nli = ["transformers>=4.30.0", "torch>=2.0.0"]
 
 [project.scripts]
 vigil = "vigil.cli:main"

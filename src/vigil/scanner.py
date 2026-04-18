@@ -953,7 +953,7 @@ def format_report(results: dict[str, list[Issue]]) -> str:
     lines.append(f'  {total} issues: {critical} CRITICAL / {warnings} WARNING / {info} INFO')
     lines.append('')
 
-    for category in ['contradictions', 'duplicates', 'stale', 'orphans']:
+    for category in ['contradictions', 'duplicates', 'isolated', 'stale', 'orphans', 'provenance']:
         issues = results.get(category, [])
         if not issues:
             continue
@@ -978,6 +978,10 @@ def format_report(results: dict[str, list[Issue]]) -> str:
                     lines.append(f'         path: {issue.details["missing_path"]}')
                 elif 'missing_ref' in issue.details:
                     lines.append(f'         ref: {issue.details["missing_ref"]}')
+            elif issue.category == 'isolated':
+                lines.append(f'         max_sim: {issue.details.get("max_similarity", "?")}')
+            elif issue.category == 'provenance':
+                lines.append(f'         missing: {", ".join(issue.details.get("missing_fields", []))}')
             lines.append('')
 
     return '\n'.join(lines)
