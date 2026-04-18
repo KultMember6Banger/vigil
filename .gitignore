@@ -1,0 +1,8 @@
+.vigil/
+__pycache__/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pyc
+chroma_store/
