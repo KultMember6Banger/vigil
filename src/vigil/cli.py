@@ -40,7 +40,7 @@ def cmd_scan(args):
     memory_dir = Path(args.memory_dir)
     store_dir = Path(args.store) if args.store else default_store_dir(memory_dir)
 
-    checks = args.checks or ['duplicates', 'orphans', 'stale', 'contradictions']
+    checks = args.checks or ['duplicates', 'isolated', 'orphans', 'stale', 'provenance', 'contradictions']
 
     print(f'Vigil scanning {memory_dir}...')
     t0 = time.time()
@@ -54,6 +54,11 @@ def cmd_scan(args):
         print(f'  [{step}/{total_steps}] Duplicates...')
         from .scanner import find_duplicates
         results['duplicates'] = find_duplicates(store_dir)
+    if 'isolated' in checks:
+        step += 1
+        print(f'  [{step}/{total_steps}] Isolated entries...')
+        from .scanner import find_isolated
+        results['isolated'] = find_isolated(store_dir)
     if 'orphans' in checks:
         step += 1
         print(f'  [{step}/{total_steps}] Orphans...')
@@ -63,7 +68,12 @@ def cmd_scan(args):
         step += 1
         print(f'  [{step}/{total_steps}] Staleness...')
         from .scanner import find_stale
-        results['stale'] = find_stale(memory_dir)
+        results['stale'] = find_stale(memory_dir, store_dir=store_dir)
+    if 'provenance' in checks:
+        step += 1
+        print(f'  [{step}/{total_steps}] Provenance...')
+        from .scanner import find_unprovenanced
+        results['provenance'] = find_unprovenanced(memory_dir)
     if 'contradictions' in checks:
         step += 1
         print(f'  [{step}/{total_steps}] Contradictions (NLI model)...')
@@ -171,7 +181,7 @@ def main():
     p_scan = sub.add_parser('scan', help='Full health scan')
     p_scan.add_argument('memory_dir', help='Directory of markdown memory files')
     p_scan.add_argument('--check',
-                        choices=['contradictions', 'duplicates', 'stale', 'orphans'],
+                        choices=['contradictions', 'duplicates', 'isolated', 'stale', 'orphans', 'provenance'],
                         action='append', dest='checks')
     p_scan.add_argument('--json', action='store_true', help='Output as JSON')
     p_scan.add_argument('--store', help='ChromaDB store path')

@@ -267,19 +267,143 @@ def find_duplicates(
     return sorted(issues, key=lambda x: x.details.get('similarity', 0), reverse=True)
 
 
-# --- 3. Staleness Scoring ---
+# --- 2b. Isolated Entry Detection ---
+
+def find_isolated(
+    store_dir: Path,
+    isolation_threshold: float = 0.3,
+) -> list[Issue]:
+    """Find memory entries with no semantic neighbors.
+
+    Brain analog: hippocampus-dropped records — facts with no binding
+    associations that will never surface via retrieval. An entry whose
+    max similarity to any other entry is below the threshold has no
+    retrieval path and is effectively dead.
+
+    Requires ChromaDB + embeddings.
+    """
+    records = _get_all_records(store_dir)
+    if not records or not records['ids']:
+        return []
+
+    import numpy as np
+
+    n = len(records['ids'])
+    if n < 2:
+        return []
+
+    sim_matrix = _build_sim_matrix(records['embeddings'])
+
+    # Per-file: best similarity to any chunk from a DIFFERENT file
+    file_best_sim = {}
+    for i in range(n):
+        src_i = records['metadatas'][i].get('source_file', '')
+        if not src_i:
+            continue
+        for j in range(n):
+            if i == j:
+                continue
+            src_j = records['metadatas'][j].get('source_file', '')
+            if src_i == src_j:
+                continue
+            sim = float(sim_matrix[i, j])
+            if src_i not in file_best_sim or sim > file_best_sim[src_i]:
+                file_best_sim[src_i] = sim
+
+    issues = []
+    for src, best_sim in sorted(file_best_sim.items()):
+        if best_sim < isolation_threshold:
+            issues.append(Issue(
+                severity='INFO',
+                category='isolated',
+                message=f'Isolated entry (max_sim={best_sim:.2f}, threshold={isolation_threshold})',
+                files=[src],
+                details={
+                    'max_similarity': round(best_sim, 3),
+                    'threshold': isolation_threshold,
+                }
+            ))
+
+    return sorted(issues, key=lambda x: x.details.get('max_similarity', 0))
+
+
+# --- 3. Staleness Scoring (Ebbinghaus-informed) ---
+
+import math
+
+
+def _ebbinghaus_retention(age_days: float, strength: float = 1.0) -> float:
+    """Ebbinghaus forgetting curve: retention = e^(-t/s).
+
+    age_days: time since last write or access
+    strength: reinforcement factor (higher = slower decay).
+              Each access multiplies strength by 1.5.
+    Returns: 0.0 (completely forgotten) to 1.0 (perfectly fresh).
+    """
+    if age_days <= 0:
+        return 1.0
+    return math.exp(-age_days / max(strength * 30, 1))
+
+
+def _get_access_data(store_dir: Path) -> dict[str, dict]:
+    """Pull access_count and last_accessed from ChromaDB metadata.
+
+    Returns {source_file: {access_count, last_accessed, ...}} aggregated
+    across all chunks for each file (max access_count, latest last_accessed).
+    """
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(path=str(store_dir))
+        collection = client.get_collection(COLLECTION_NAME)
+        count = collection.count()
+        if count == 0:
+            return {}
+        records = collection.get(include=['metadatas'], limit=count)
+    except Exception:
+        return {}
+
+    access = {}
+    for meta in records['metadatas']:
+        src = meta.get('source_file', '')
+        if not src:
+            continue
+        ac = int(meta.get('access_count', 0))
+        la = meta.get('last_accessed', '')
+        if src not in access:
+            access[src] = {'access_count': ac, 'last_accessed': la}
+        else:
+            access[src]['access_count'] = max(access[src]['access_count'], ac)
+            if la > access[src]['last_accessed']:
+                access[src]['last_accessed'] = la
+    return access
+
 
 def find_stale(
     memory_dir: Path,
     warn_days: int = 14,
     critical_days: int = 30,
+    store_dir: Path | None = None,
 ) -> list[Issue]:
-    """Score memories for staleness based on age and content volatility.
+    """Score memories for staleness using Ebbinghaus-informed decay.
 
-    No heavy dependencies — pure filesystem + regex.
+    Three signals:
+    - File/content age with exponential decay (not linear)
+    - Volatility markers (temporal words, TODOs, status fields)
+    - Access frequency (if ChromaDB available via store_dir)
+
+    Access resets the decay curve: a 60-day-old file accessed yesterday
+    is fresher than a 20-day-old file never accessed.
+
+    No heavy dependencies for base operation — ChromaDB only used
+    when store_dir is provided for access-frequency enrichment.
     """
     issues = []
     now = datetime.now()
+
+    # Pull access data if ChromaDB available
+    access_data = {}
+    if store_dir is not None:
+        access_data = _get_access_data(store_dir)
 
     VOLATILE = [
         (r'\b(current|currently|ongoing|in.?progress|active)\b', 'temporal_state', 0.3),
@@ -303,6 +427,7 @@ def find_stale(
         if age_days < warn_days:
             continue
 
+        # Volatility score
         volatility = 0.0
         markers = []
         for pattern, label, weight in VOLATILE:
@@ -311,19 +436,49 @@ def find_stale(
                 volatility += weight * len(hits)
                 markers.append(f'{label}({len(hits)})')
 
+        # Newest date in content
         dates = []
         for m in DATE_RE.finditer(body):
             try:
                 dates.append(datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))))
             except ValueError:
                 continue
-
         newest = max(dates) if dates else mtime
         content_age = (now - newest).days
 
+        # Access-frequency enrichment
+        file_access = access_data.get(f.stem, {})
+        access_count = file_access.get('access_count', 0)
+        last_accessed_str = file_access.get('last_accessed', '')
+
+        # Effective age: time since last access OR last write, whichever is newer
+        effective_age = age_days
+        if last_accessed_str:
+            try:
+                la_dt = datetime.fromisoformat(last_accessed_str.replace('Z', '+00:00'))
+                la_naive = la_dt.replace(tzinfo=None)
+                access_age = (now - la_naive).days
+                effective_age = min(effective_age, access_age)
+            except (ValueError, TypeError):
+                pass
+
+        # Ebbinghaus: access count boosts retention strength
+        # Each access multiplies strength by 1.5 (spaced repetition effect)
+        strength = 1.5 ** min(access_count, 10)  # cap at 10 to prevent overflow
+        retention = _ebbinghaus_retention(effective_age, strength)
+
+        # Staleness = inverse of retention, boosted by volatility
+        # retention 1.0 → staleness 0.0 (fresh)
+        # retention 0.0 → staleness 1.0 (stale)
+        base_staleness = 1.0 - retention
+
+        # Content age adds staleness if content dates are old
+        content_retention = _ebbinghaus_retention(content_age, strength)
+        content_staleness = 1.0 - content_retention
+
         staleness = (
-            (age_days / critical_days) * 0.4
-            + (content_age / critical_days) * 0.3
+            base_staleness * 0.4
+            + content_staleness * 0.3
             + min(volatility, 1.0) * 0.3
         )
 
@@ -331,17 +486,25 @@ def find_stale(
             continue
 
         severity = 'CRITICAL' if staleness > 1.0 else 'WARNING'
+        msg = f'Staleness {staleness:.2f} (eff_age: {effective_age}d, content: {content_age}d'
+        if access_count > 0:
+            msg += f', accessed: {access_count}x'
+        msg += ')'
+
         issues.append(Issue(
             severity=severity,
             category='stale',
-            message=f'Staleness {staleness:.2f} (file: {age_days}d, content: {content_age}d)',
+            message=msg,
             files=[f.stem],
             details={
                 'staleness_score': round(staleness, 3),
                 'file_age_days': age_days,
+                'effective_age_days': effective_age,
                 'content_age_days': content_age,
                 'volatility': round(volatility, 3),
                 'markers': markers,
+                'access_count': access_count,
+                'retention': round(retention, 3),
                 'type': parse_frontmatter(content)[0].get('type', 'unknown'),
             }
         ))
@@ -411,6 +574,58 @@ def find_orphans(
                 ))
 
     return issues
+
+
+# --- 4b. Provenance Check (Source Monitoring) ---
+
+REQUIRED_PROVENANCE = {'name', 'type', 'description'}
+
+
+def find_unprovenanced(
+    memory_dir: Path,
+    required_fields: set[str] | None = None,
+) -> list[Issue]:
+    """Flag memory files missing provenance metadata.
+
+    Brain analog: source monitoring failure → source amnesia.
+    Files without metadata about their origin are untrusted —
+    they are facts without provenance, vulnerable to confabulation.
+
+    No heavy dependencies — pure filesystem + frontmatter parsing.
+    """
+    if required_fields is None:
+        required_fields = REQUIRED_PROVENANCE
+
+    issues = []
+
+    for f in sorted(memory_dir.glob('*.md')):
+        if f.name in ('MEMORY.md', 'README.md'):
+            continue
+
+        content = f.read_text(encoding='utf-8', errors='replace')
+        meta, _ = parse_frontmatter(content)
+
+        missing = []
+        for field in sorted(required_fields):
+            val = meta.get(field, '').strip()
+            if not val:
+                missing.append(field)
+
+        if missing:
+            severity = 'WARNING' if len(missing) < len(required_fields) else 'CRITICAL'
+            issues.append(Issue(
+                severity=severity,
+                category='provenance',
+                message=f'Missing provenance: {", ".join(missing)}',
+                files=[f.stem],
+                details={
+                    'missing_fields': missing,
+                    'has_frontmatter': bool(meta),
+                    'fields_present': sorted(meta.keys()) if meta else [],
+                }
+            ))
+
+    return sorted(issues, key=lambda x: len(x.details.get('missing_fields', [])), reverse=True)
 
 
 # --- 5. Pre-Write Contradiction Check ---
@@ -496,37 +711,116 @@ def pre_write_check(
             if logits_arr.ndim == 1:
                 logits_arr = logits_arr.reshape(1, -1)
             probs = _softmax(logits_arr)
-            c_prob = float(probs[0, 0])
-
-            if c_prob < nli_threshold:
-                continue
+            # DeBERTa NLI labels: [contradiction, neutral, entailment]
+            c_prob = float(probs[0, 0])  # contradiction
+            e_prob = float(probs[0, 2])  # entailment
 
             ent_new = _extract_entities(chunk)
             ent_old = _extract_entities(existing_text)
-            if not (ent_new & ent_old):
-                continue
 
             key = (existing_file, chunk[:50])
             if key in seen:
                 continue
-            seen.add(key)
 
-            shared = list(ent_new & ent_old)[:3]
-            issues.append(Issue(
-                severity='CRITICAL' if c_prob > 0.9 else 'WARNING',
-                category='pre_write_conflict',
-                message=f'New text may contradict: {existing_file} (NLI={c_prob:.2f})',
-                files=[existing_file],
-                details={
-                    'new_text': chunk[:200],
-                    'existing_text': existing_text[:200],
-                    'nli_score': round(c_prob, 3),
-                    'similarity': round(sim, 3),
-                    'shared_entities': shared,
-                }
-            ))
+            # Contradiction: high c_prob + shared entities
+            if c_prob >= nli_threshold and (ent_new & ent_old):
+                seen.add(key)
+                shared = list(ent_new & ent_old)[:3]
+                issues.append(Issue(
+                    severity='CRITICAL' if c_prob > 0.9 else 'WARNING',
+                    category='pre_write_conflict',
+                    message=f'New text may contradict: {existing_file} (NLI={c_prob:.2f})',
+                    files=[existing_file],
+                    details={
+                        'new_text': chunk[:200],
+                        'existing_text': existing_text[:200],
+                        'nli_score': round(c_prob, 3),
+                        'similarity': round(sim, 3),
+                        'shared_entities': shared,
+                    }
+                ))
 
-    return sorted(issues, key=lambda x: x.details.get('nli_score', 0), reverse=True)[:10]
+            # Supersession: high similarity + high entailment = new version of same fact
+            # Brain analog: retrieval-induced forgetting — accessing new version
+            # suppresses the old version's accessibility
+            elif e_prob > 0.6 and sim > 0.65 and (ent_new & ent_old):
+                seen.add(key)
+                shared = list(ent_new & ent_old)[:3]
+                issues.append(Issue(
+                    severity='INFO',
+                    category='pre_write_supersession',
+                    message=f'May supersede: {existing_file} (entail={e_prob:.2f}, sim={sim:.2f})',
+                    files=[existing_file],
+                    details={
+                        'new_text': chunk[:200],
+                        'existing_text': existing_text[:200],
+                        'entailment_score': round(e_prob, 3),
+                        'similarity': round(sim, 3),
+                        'shared_entities': shared,
+                        'existing_id': results['ids'][0][j],
+                    }
+                ))
+
+    return sorted(issues, key=lambda x: x.details.get('nli_score',
+                   x.details.get('entailment_score', 0)), reverse=True)[:10]
+
+
+def apply_supersession_decay(
+    issues: list[Issue],
+    store_dir: Path,
+    decay_factor: float = 0.7,
+) -> int:
+    """Decay health scores for superseded entries.
+
+    Brain analog: retrieval-induced forgetting — when a newer version
+    of a fact is accessed, the old version's accessibility decreases.
+
+    Call after pre_write_check returns supersession issues and the
+    new memory has been written.
+
+    Returns number of records decayed.
+    """
+    supersessions = [i for i in issues if i.category == 'pre_write_supersession']
+    if not supersessions:
+        return 0
+
+    import chromadb
+    client = chromadb.PersistentClient(path=str(store_dir))
+    try:
+        collection = client.get_collection(COLLECTION_NAME)
+    except Exception:
+        return 0
+
+    decayed = 0
+    for issue in supersessions:
+        source = issue.files[0] if issue.files else ''
+        if not source:
+            continue
+
+        try:
+            records = collection.get(
+                where={'source_file': source},
+                include=['metadatas'],
+            )
+            if not records['ids']:
+                continue
+
+            batch_ids = []
+            batch_metas = []
+            for i, rec_id in enumerate(records['ids']):
+                meta = dict(records['metadatas'][i])
+                old_health = float(meta.get('health_score', 1.0))
+                meta['health_score'] = round(max(0.1, old_health * decay_factor), 3)
+                meta['superseded_by'] = issue.details.get('new_text', '')[:100]
+                batch_ids.append(rec_id)
+                batch_metas.append(meta)
+
+            collection.update(ids=batch_ids, metadatas=batch_metas)
+            decayed += len(batch_ids)
+        except Exception:
+            continue
+
+    return decayed
 
 
 # --- 6. Health Scores ---
@@ -542,6 +836,8 @@ def compute_health_scores(results: dict[str, list[Issue]]) -> dict[str, float]:
         'duplicates': 0.1,
         'stale': 0.25,
         'orphans': 0.15,
+        'provenance': 0.15,
+        'isolated': 0.1,
     }
 
     for category, issues_list in results.items():
@@ -616,15 +912,19 @@ def full_scan(
     if store_dir is None:
         store_dir = default_store_dir(memory_dir)
     if checks is None:
-        checks = ['duplicates', 'orphans', 'stale', 'contradictions']
+        checks = ['duplicates', 'isolated', 'orphans', 'stale', 'provenance', 'contradictions']
 
     results = {}
     if 'duplicates' in checks:
         results['duplicates'] = find_duplicates(store_dir)
+    if 'isolated' in checks:
+        results['isolated'] = find_isolated(store_dir)
     if 'orphans' in checks:
         results['orphans'] = find_orphans(memory_dir)
     if 'stale' in checks:
-        results['stale'] = find_stale(memory_dir)
+        results['stale'] = find_stale(memory_dir, store_dir=store_dir)
+    if 'provenance' in checks:
+        results['provenance'] = find_unprovenanced(memory_dir)
     if 'contradictions' in checks:
         results['contradictions'] = find_contradictions(store_dir)
     return results

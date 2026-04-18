@@ -94,6 +94,8 @@ def chunk_text(text: str, source_file: str, meta: dict,
                 'record_type': meta.get('type', ''),
                 'memory_type': meta.get('type', ''),
                 'name': meta.get('name', ''),
+                'access_count': 0,
+                'last_accessed': '',
             }
         })
 

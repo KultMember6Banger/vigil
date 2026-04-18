@@ -12,13 +12,16 @@ Point Vigil at a directory of markdown files (with optional YAML frontmatter) an
 
 - **Contradictions** — memory pairs asserting conflicting facts, detected via NLI cross-encoder (DeBERTa)
 - **Duplicates** — near-identical memories across different files (cosine similarity > 0.85)
-- **Stale memories** — likely outdated based on file age, content dates, and volatility markers
+- **Isolated entries** — memories with no semantic neighbors, effectively unreachable by retrieval
+- **Stale memories** — Ebbinghaus-informed exponential decay, factoring in access frequency
 - **Orphan references** — broken file paths and cross-references to memories that don't exist
+- **Missing provenance** — files without required metadata (name, type, description)
 
 Plus:
 
 - **Pre-write check** — real-time gate that catches contradictions *before* you write a new memory
 - **Health scores** — per-file health score (0.1 to 1.0) written to ChromaDB metadata, usable by downstream RAG to deprioritize unhealthy memories
+- **Access tracking** — records when and how often each memory is retrieved, feeds staleness scoring
 
 ## Quickstart
 
@@ -49,14 +52,16 @@ vigil health ./memory/
 5. Entity overlap filter requires shared specific terms to reduce false positives
 6. Results capped at top 25 most confident contradictions
 
-### Staleness scoring
+### Staleness scoring (Ebbinghaus-informed)
 
-Composite score from three signals:
-- **File age** — days since last modification
+Uses exponential decay (not linear) with three signals:
+- **Effective age** — days since last access or modification, whichever is newer
 - **Content age** — newest date found in the text
 - **Volatility** — presence of temporal markers (`current`, `pending`, `status:`, `TODO`)
 
-Formula: `staleness = (file_age/30) * 0.4 + (content_age/30) * 0.3 + min(volatility, 1.0) * 0.3`
+Retention follows the Ebbinghaus forgetting curve: `retention = e^(-t/s)` where `s` (strength) increases with each access (spaced repetition effect). A frequently-accessed 90-day-old memory stays healthier than a never-accessed 14-day-old one.
+
+When ChromaDB is available, access tracking data enriches the score. Without it, falls back to file-age-only mode.
 
 ### Health-weighted RAG
 
@@ -102,7 +107,7 @@ Run health checks.
 
 | Flag | Description |
 |------|-------------|
-| `--check <type>` | Run specific check(s): `contradictions`, `duplicates`, `stale`, `orphans` |
+| `--check <type>` | Run specific check(s): `contradictions`, `duplicates`, `isolated`, `stale`, `orphans`, `provenance` |
 | `--json` | Output as JSON |
 | `--store <path>` | Custom ChromaDB location |
 
@@ -123,26 +128,40 @@ Full scan + write health scores to ChromaDB.
 ## Python API
 
 ```python
-from vigil.scanner import find_contradictions, find_stale, find_orphans, pre_write_check
+from vigil.scanner import (
+    find_contradictions, find_stale, find_orphans,
+    find_duplicates, find_isolated, find_unprovenanced,
+    pre_write_check,
+)
 from vigil.indexer import build_index
 
 # Index
 build_index(Path('./memory/'))
 
-# Scan
+store = Path('./memory/.vigil/')
+
+# Lightweight checks (no heavy deps)
 stale = find_stale(Path('./memory/'))
 orphans = find_orphans(Path('./memory/'))
+unprovenanced = find_unprovenanced(Path('./memory/'))
+
+# Enriched staleness (with access frequency from ChromaDB)
+stale_enriched = find_stale(Path('./memory/'), store_dir=store)
+
+# Heavy checks (require ChromaDB + embeddings)
+duplicates = find_duplicates(store)
+isolated = find_isolated(store)
 
 # Pre-write gate
 issues = pre_write_check(
     "The API uses Firebase for auth",
-    store_dir=Path('./memory/.vigil/'),
+    store_dir=store,
 )
 for issue in issues:
     print(f"[{issue.severity}] {issue.message}")
 ```
 
-`find_stale()` and `find_orphans()` have no heavy dependencies — they work with just the standard library. Contradiction detection and pre-write checks require `chromadb` and `sentence-transformers`.
+`find_stale()`, `find_orphans()`, and `find_unprovenanced()` have no heavy dependencies — they work with just the standard library. Contradiction/duplicate/isolated detection and pre-write checks require `chromadb` and `sentence-transformers`.
 
 ## Requirements
 
