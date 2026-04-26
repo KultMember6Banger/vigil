@@ -68,11 +68,13 @@ When ChromaDB is available, access tracking data enriches the score. Without it,
 Vigil writes per-file health scores into ChromaDB metadata. Your RAG retrieval can use these to deprioritize unhealthy memories:
 
 ```python
-# In your retrieval code:
-raw_score = 1 - (distance / 2)  # cosine similarity
+# In your retrieval code (ChromaDB cosine distance = 1 - cosine_similarity):
+raw_score = 1 - distance  # cosine similarity
 health = float(metadata.get('health_score', 1.0))
 final_score = raw_score * health  # unhealthy memories rank lower
 ```
+
+[Steno](https://github.com/KultMember6Banger/steno) has this built in — its retrieval engine applies health-weighted scoring automatically.
 
 ## Memory file format
 

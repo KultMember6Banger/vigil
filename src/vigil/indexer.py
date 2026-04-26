@@ -13,9 +13,6 @@ import re
 import time
 from pathlib import Path
 
-import chromadb
-from sentence_transformers import SentenceTransformer
-
 EMBED_MODEL = 'all-MiniLM-L6-v2'
 COLLECTION_NAME = 'vigil_memory'
 BATCH_SIZE = 64
@@ -138,6 +135,9 @@ def build_index(
     """
     if store_dir is None:
         store_dir = default_store_dir(memory_dir)
+
+    import chromadb
+    from sentence_transformers import SentenceTransformer
 
     store_dir.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(store_dir))
