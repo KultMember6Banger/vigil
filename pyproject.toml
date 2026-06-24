@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vigil-memory"
-version = "0.3.0"
+version = "0.3.1"
 description = "Memory health monitor for AI agents — detects contradictions, duplicates, staleness, and orphan references"
 readme = "README.md"
 license = "Apache-2.0"

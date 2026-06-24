@@ -173,6 +173,23 @@ Vigil reads `access_count` / `last_accessed` from each record's metadata and
 writes back `health_score`. Steno's retrieval applies `final_score =
 similarity * health_score` automatically.
 
+### Shared core & the self-curating loop
+
+The obviously-duplicated plumbing both projects need — YAML frontmatter
+parsing, a cached `SentenceTransformer` loader, the cosine↔distance conversion,
+ChromaDB client/collection setup, and `MEMORY_STORE` / `MEMORY_COLLECTION`
+resolution — lives in a **canonical shared core, `memcore`**, vendored
+identically into both repos (here at `src/vigil/memcore.py`). Keep the two
+copies in sync; a published `memcore` package is its eventual home.
+
+The end-to-end **self-curating loop** (compress → gate → index → score →
+health-weighted retrieve) and the **unified MCP server** (one stdio entry point
+that exposes Steno's tools always and Vigil's `memory_audit` / `memory_check` /
+`memory_fix` / `memory_health` when Vigil is importable) live on the **Steno**
+side — see `steno curate` and `memory_mcp.py` in the
+[Steno](https://github.com/KultMember6Banger/steno) repo. Vigil is soft-imported
+there, so the loop degrades gracefully when Vigil isn't installed.
+
 ## MCP server
 
 Vigil ships a stdio JSON-RPC **MCP server** (protocol `2024-11-05`) exposing

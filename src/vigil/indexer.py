@@ -18,12 +18,14 @@ from pathlib import Path
 
 import yaml
 
+from . import memcore
+
 EMBED_MODEL = 'all-MiniLM-L6-v2'
 
 # Shared default collection name. Steno indexes into the same default so Vigil
 # can audit exactly what Steno builds. Override via the MEMORY_COLLECTION env
 # var or the --collection CLI flag.
-DEFAULT_COLLECTION_NAME = 'agent_memory'
+DEFAULT_COLLECTION_NAME = memcore.DEFAULT_COLLECTION_NAME
 BATCH_SIZE = 64
 MTIME_FILE = 'file_mtimes.json'
 
@@ -35,10 +37,9 @@ def resolve_collection_name(collection_name: str | None = None) -> str:
     """Resolve the ChromaDB collection name.
 
     Precedence: explicit arg > MEMORY_COLLECTION env var > shared default.
+    Delegates to the shared core.
     """
-    if collection_name:
-        return collection_name
-    return os.environ.get('MEMORY_COLLECTION', DEFAULT_COLLECTION_NAME)
+    return memcore.resolve_collection(collection_name)
 
 
 # Backwards-compatible module-level default (resolves env at import time).
@@ -51,10 +52,8 @@ def default_store_dir(memory_dir: Path) -> Path:
     Honors the MEMORY_STORE env var if set, otherwise .vigil/ inside the
     memory directory.
     """
-    env_store = os.environ.get('MEMORY_STORE')
-    if env_store:
-        return Path(env_store)
-    return memory_dir / '.vigil'
+    return memcore.resolve_store(
+        None, 'MEMORY_STORE', default=memory_dir / '.vigil')
 
 
 def _coerce_str(val) -> str:
