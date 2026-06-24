@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vigil-memory"
-version = "0.1.0"
+version = "0.2.0"
 description = "Memory health monitor for AI agents — detects contradictions, duplicates, staleness, and orphan references"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
-    { name = "Eli", email = "vigil@example.com" },
+    { name = "KultMember6Banger" },
 ]
 keywords = ["ai", "agents", "memory", "health", "contradictions", "NLI"]
 classifiers = [
@@ -24,6 +24,7 @@ dependencies = [
     "chromadb>=0.4.0",
     "numpy>=1.24.0",
     "sentence-transformers>=2.2.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -31,10 +32,14 @@ nli = ["transformers>=4.30.0", "torch>=2.0.0"]
 
 [project.scripts]
 vigil = "vigil.cli:main"
+vigil-mcp = "mcp_server:main"
 
 [project.urls]
-Homepage = "https://github.com/kultmember6banger/vigil"
-Issues = "https://github.com/kultmember6banger/vigil/issues"
+Homepage = "https://github.com/KultMember6Banger/vigil"
+Issues = "https://github.com/KultMember6Banger/vigil/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vigil"]
+# Ship the top-level MCP server module so the `vigil-mcp` entry point resolves.
+include = ["mcp_server.py"]
+sources = ["src", "."]

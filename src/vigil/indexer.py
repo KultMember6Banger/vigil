@@ -8,46 +8,92 @@ Storage: ChromaDB persistent client, one collection per memory directory.
 Incremental: tracks file mtimes, only re-indexes changed files.
 """
 
+from __future__ import annotations
+
 import json
+import os
 import re
 import time
 from pathlib import Path
 
+import yaml
+
 EMBED_MODEL = 'all-MiniLM-L6-v2'
-COLLECTION_NAME = 'vigil_memory'
+
+# Shared default collection name. Steno indexes into the same default so Vigil
+# can audit exactly what Steno builds. Override via the MEMORY_COLLECTION env
+# var or the --collection CLI flag.
+DEFAULT_COLLECTION_NAME = 'agent_memory'
 BATCH_SIZE = 64
 MTIME_FILE = 'file_mtimes.json'
 
+# Frontmatter pattern: leading --- ... --- block (matches Steno's parser).
+FRONTMATTER_RE = re.compile(r'^---\s*\n(.*?)\n---\s*\n?', re.DOTALL)
+
+
+def resolve_collection_name(collection_name: str | None = None) -> str:
+    """Resolve the ChromaDB collection name.
+
+    Precedence: explicit arg > MEMORY_COLLECTION env var > shared default.
+    """
+    if collection_name:
+        return collection_name
+    return os.environ.get('MEMORY_COLLECTION', DEFAULT_COLLECTION_NAME)
+
+
+# Backwards-compatible module-level default (resolves env at import time).
+COLLECTION_NAME = resolve_collection_name()
+
 
 def default_store_dir(memory_dir: Path) -> Path:
-    """Default ChromaDB store location: .vigil/ inside the memory directory."""
+    """Default ChromaDB store location.
+
+    Honors the MEMORY_STORE env var if set, otherwise .vigil/ inside the
+    memory directory.
+    """
+    env_store = os.environ.get('MEMORY_STORE')
+    if env_store:
+        return Path(env_store)
     return memory_dir / '.vigil'
+
+
+def _coerce_str(val) -> str:
+    """Coerce a frontmatter value to a string safely.
+
+    YAML values may be lists, ints, bools, None, etc. ChromaDB metadata and
+    the provenance checks expect strings, so coerce defensively.
+    """
+    if val is None:
+        return ''
+    if isinstance(val, str):
+        return val
+    if isinstance(val, (list, tuple)):
+        return ', '.join(_coerce_str(v) for v in val)
+    if isinstance(val, bool):
+        return 'true' if val else 'false'
+    return str(val)
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
     """Parse YAML frontmatter from markdown text.
 
-    Returns (metadata_dict, body_text). If no frontmatter found,
-    returns ({}, full_text).
+    Uses pyyaml (yaml.safe_load) so nested YAML, lists, and multiline values
+    parse correctly. Returns (metadata_dict, body_text). On missing or invalid
+    frontmatter, returns ({}, full_text).
+
+    NOTE: metadata values may be non-strings (lists, ints, bools). Consumers
+    must guard/coerce — see _coerce_str.
     """
-    if not text.startswith('---'):
+    m = FRONTMATTER_RE.match(text)
+    if not m:
         return {}, text
-
-    # Find closing ---
-    end = text.find('---', 3)
-    if end == -1:
+    try:
+        meta = yaml.safe_load(m.group(1))
+    except yaml.YAMLError:
         return {}, text
-
-    front = text[3:end].strip()
-    body = text[end + 3:].strip()
-
-    meta = {}
-    for line in front.split('\n'):
-        line = line.strip()
-        if ':' in line:
-            key, _, val = line.partition(':')
-            meta[key.strip()] = val.strip().strip('"').strip("'")
-
+    if not isinstance(meta, dict):
+        return {}, text
+    body = text[m.end():].strip()
     return meta, body
 
 
@@ -82,17 +128,19 @@ def chunk_text(text: str, source_file: str, meta: dict,
     for i, chunk in enumerate(chunks):
         if len(chunk.strip()) < MIN_CHUNK:
             continue
+        mtype = _coerce_str(meta.get('type', ''))
         results.append({
             'id': f'{source_file}:{i}',
             'text': chunk,
             'metadata': {
                 'source_file': source_file,
                 'chunk_index': i,
-                'record_type': meta.get('type', ''),
-                'memory_type': meta.get('type', ''),
-                'name': meta.get('name', ''),
+                'record_type': mtype,
+                'memory_type': mtype,
+                'name': _coerce_str(meta.get('name', '')),
                 'access_count': 0,
                 'last_accessed': '',
+                'health_score': 1.0,
             }
         })
 
@@ -121,6 +169,7 @@ def build_index(
     store_dir: Path | None = None,
     model_name: str = EMBED_MODEL,
     full_rebuild: bool = False,
+    collection_name: str | None = None,
 ) -> dict:
     """Build or update ChromaDB index from a memory directory.
 
@@ -129,12 +178,14 @@ def build_index(
         store_dir: ChromaDB storage location (default: memory_dir/.vigil/)
         model_name: sentence-transformer model name
         full_rebuild: if True, delete and rebuild entire index
+        collection_name: ChromaDB collection (default: env/shared default)
 
     Returns:
         dict with stats: indexed, skipped, total, elapsed
     """
     if store_dir is None:
         store_dir = default_store_dir(memory_dir)
+    collection_name = resolve_collection_name(collection_name)
 
     import chromadb
     from sentence_transformers import SentenceTransformer
@@ -144,12 +195,12 @@ def build_index(
 
     if full_rebuild:
         try:
-            client.delete_collection(COLLECTION_NAME)
+            client.delete_collection(collection_name)
         except Exception:
             pass
 
     collection = client.get_or_create_collection(
-        COLLECTION_NAME,
+        collection_name,
         metadata={'hnsw:space': 'cosine'},
     )
 

@@ -4,7 +4,9 @@ Detects contradictions, duplicates, staleness, isolated entries,
 orphan references, and missing provenance in markdown-based memory stores.
 """
 
-__version__ = "0.1.0"
+from __future__ import annotations
+
+__version__ = "0.2.0"
 
 from vigil.scanner import (
     Issue,
