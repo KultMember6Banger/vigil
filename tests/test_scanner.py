@@ -93,6 +93,31 @@ def test_compute_health_scores():
     print(f"  OK compute_health_scores (a={scores['a.md']:.2f}, b={scores['b.md']:.2f})")
 
 
+def test_nested_metadata_type_not_flagged():
+    # Claude Code memory nests `type` under `metadata:` — must not be a false positive.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        d = Path(tmpdir)
+        _write_memory(d, "nested.md", "---\nname: Nested\ndescription: type lives under metadata\nmetadata:\n  type: user\n---\nBody.")
+        _write_memory(d, "flat_missing.md", "---\nname: Flat\ndescription: no type anywhere\n---\nBody.")
+        issues = find_unprovenanced(d)
+        flagged = [f for i in issues for f in i.files]
+        assert not any("nested" in f for f in flagged), f"nested metadata.type should satisfy provenance: {flagged}"
+        assert any("flat_missing" in f for f in flagged), f"genuinely missing type should still flag: {flagged}"
+        print("  OK nested_metadata_type_not_flagged")
+
+
+def test_wikilink_orphans():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        d = Path(tmpdir)
+        _write_memory(d, "a.md", "---\nname: A\ntype: project\ndescription: links\n---\nSee [[b]] and [[ghost]].")
+        _write_memory(d, "b.md", "---\nname: B\ntype: project\ndescription: exists\n---\nContent.")
+        issues = find_orphans(d)
+        msgs = [i.message for i in issues]
+        assert any("ghost" in m for m in msgs), f"broken [[ghost]] wikilink should be flagged: {msgs}"
+        assert not any("[[b]]" in m or "'b'" in m or " b.md" in m for m in msgs), f"valid [[b]] must not flag: {msgs}"
+        print("  OK wikilink_orphans")
+
+
 def test_format_report():
     results = {
         "stale": [Issue(severity="WARNING", category="stale", message="90 days old", files=["old.md"])],
