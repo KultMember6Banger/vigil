@@ -10,6 +10,7 @@ with only the standard library + the indexer's frontmatter parser.
 
 from __future__ import annotations
 
+import fnmatch
 import functools
 import re
 from pathlib import Path
@@ -139,6 +140,37 @@ def _line_context(text: str, pos: int, ctx: int = 50) -> str:
     return text[start:end].replace('\n', ' ').strip()
 
 
+def _is_ignored(path: Path, memory_dir: Path, ignore_globs: list | None) -> bool:
+    """True if `path` matches any config ignore glob (relative to memory_dir).
+
+    Globs are matched against both the file name and its path relative to the
+    memory dir, so `*.draft.md` and `scratch/*` both work.
+    """
+    if not ignore_globs:
+        return False
+    try:
+        rel = path.relative_to(memory_dir)
+    except ValueError:
+        rel = Path(path.name)
+    rel_str = str(rel)
+    for pat in ignore_globs:
+        if path.match(pat) or Path(rel_str).match(pat) or fnmatch.fnmatch(rel_str, pat):
+            return True
+    return False
+
+
+def _orphan_line_number(content: str, ref: str) -> int:
+    """1-based line number of the first occurrence of `ref` in `content`.
+
+    Used by `vigil fix` to point at broken refs (file + line). Returns 0 when
+    not found in the raw content.
+    """
+    for n, line in enumerate(content.splitlines(), start=1):
+        if ref in line:
+            return n
+    return 0
+
+
 # --- 1. Contradiction Detection ---
 
 def find_contradictions(
@@ -149,6 +181,7 @@ def find_contradictions(
     collection_name: str | None = None,
     records=None,
     sim_matrix=None,
+    memory_dir: Path | None = None,
 ) -> list[Issue]:
     """Find memory pairs that contradict each other.
 
@@ -159,6 +192,11 @@ def find_contradictions(
     `records` and `sim_matrix` may be supplied by full_scan to avoid
     re-reading embeddings and rebuilding the dense NxN matrix; they are
     computed internally when omitted (standalone use).
+
+    When `memory_dir` is provided, each contradiction Issue gains a
+    `suggested_keep` (the file of the pair with newer mtime + higher
+    access_count + higher health) — advisory only; `vigil fix` surfaces it but
+    never auto-deletes.
     """
     import numpy as np
 
@@ -216,6 +254,18 @@ def find_contradictions(
 
     probs = _softmax(np.array(all_logits))
 
+    # Resolution signals for `suggested_keep` (advisory; only when memory_dir
+    # is known so we can read mtimes). Pull access + health once.
+    access_data = {}
+    health_data = {}
+    if memory_dir is not None:
+        access_data = _get_access_data(store_dir, collection_name)
+        try:
+            from .resolve import load_health_data
+            health_data = load_health_data(store_dir, collection_name)
+        except Exception:
+            health_data = {}
+
     issues = []
     for idx, (i, j, sim) in enumerate(candidates):
         c_prob = float(probs[idx, 0])
@@ -228,22 +278,32 @@ def find_contradictions(
         if not overlap:
             continue
 
+        src_a = records['metadatas'][i].get('source_file', '')
+        src_b = records['metadatas'][j].get('source_file', '')
+
+        details = {
+            'text_a': records['documents'][i][:200],
+            'text_b': records['documents'][j][:200],
+            'nli_score': round(c_prob, 3),
+            'similarity': round(sim, 3),
+            'shared_entities': list(overlap)[:5],
+        }
+
+        if memory_dir is not None and src_a and src_b:
+            from .resolve import file_signals, choose_keep
+            sig_a = file_signals(memory_dir, src_a, access_data, health_data)
+            sig_b = file_signals(memory_dir, src_b, access_data, health_data)
+            keep, archive = choose_keep(sig_a, sig_b)
+            details['suggested_keep'] = keep
+            details['suggested_archive'] = archive
+
         severity = 'CRITICAL' if c_prob > 0.95 else 'WARNING'
         issues.append(Issue(
             severity=severity,
             category='contradiction',
             message=f'Contradiction (NLI={c_prob:.2f}, sim={sim:.2f})',
-            files=[
-                records['metadatas'][i].get('source_file', ''),
-                records['metadatas'][j].get('source_file', ''),
-            ],
-            details={
-                'text_a': records['documents'][i][:200],
-                'text_b': records['documents'][j][:200],
-                'nli_score': round(c_prob, 3),
-                'similarity': round(sim, 3),
-                'shared_entities': list(overlap)[:5],
-            }
+            files=[src_a, src_b],
+            details=details,
         ))
 
     issues.sort(key=lambda x: x.details.get('nli_score', 0), reverse=True)
@@ -431,6 +491,12 @@ def find_stale(
     critical_days: int = 30,
     store_dir: Path | None = None,
     collection_name: str | None = None,
+    now: datetime | None = None,
+    volatility_markers: list | None = None,
+    base_weight: float = 0.4,
+    content_weight: float = 0.3,
+    volatility_weight: float = 0.3,
+    ignore_globs: list | None = None,
 ) -> list[Issue]:
     """Score memories for staleness using Ebbinghaus-informed decay.
 
@@ -442,28 +508,38 @@ def find_stale(
     Access resets the decay curve: a 60-day-old file accessed yesterday
     is fresher than a 20-day-old file never accessed.
 
-    No heavy dependencies for base operation — ChromaDB only used
+    `now` may be passed for deterministic testing/snapshots (defaults to
+    datetime.now() at call time, NOT import time). `volatility_markers` and the
+    three blend weights come from VigilConfig; `ignore_globs` skips matching
+    files. No heavy dependencies for base operation — ChromaDB only used
     when store_dir is provided for access-frequency enrichment.
     """
     issues = []
-    now = datetime.now()
+    if now is None:
+        now = datetime.now()
 
     # Pull access data if ChromaDB available
     access_data = {}
     if store_dir is not None:
         access_data = _get_access_data(store_dir, collection_name)
 
-    VOLATILE = [
-        (r'\b(current|currently|ongoing|in.?progress|active)\b', 'temporal_state', 0.3),
-        (r'\b(pending|waiting|queued|blocked|next)\b', 'pending_action', 0.2),
-        (r'\bstatus:\s*\w+', 'explicit_status', 0.3),
-        (r'\b(todo|TODO|FIXME|HACK|TEMP)\b', 'action_marker', 0.2),
-    ]
+    if volatility_markers is None:
+        VOLATILE = [
+            (r'\b(current|currently|ongoing|in.?progress|active)\b', 'temporal_state', 0.3),
+            (r'\b(pending|waiting|queued|blocked|next)\b', 'pending_action', 0.2),
+            (r'\bstatus:\s*\w+', 'explicit_status', 0.3),
+            (r'\b(todo|TODO|FIXME|HACK|TEMP)\b', 'action_marker', 0.2),
+        ]
+    else:
+        VOLATILE = [(m['pattern'], m.get('label', 'marker'), float(m.get('weight', 0.2)))
+                    for m in volatility_markers]
 
     DATE_RE = re.compile(r'(\d{4})-(\d{2})-(\d{2})')
 
     for f in sorted(memory_dir.glob('*.md')):
         if f.name in ('MEMORY.md', 'README.md'):
+            continue
+        if _is_ignored(f, memory_dir, ignore_globs):
             continue
 
         content = f.read_text(encoding='utf-8', errors='replace')
@@ -525,9 +601,9 @@ def find_stale(
         content_staleness = 1.0 - content_retention
 
         staleness = (
-            base_staleness * 0.4
-            + content_staleness * 0.3
-            + min(volatility, 1.0) * 0.3
+            base_staleness * base_weight
+            + content_staleness * content_weight
+            + min(volatility, 1.0) * volatility_weight
         )
 
         if staleness < 0.5:
@@ -567,10 +643,13 @@ def find_stale(
 
 def find_orphans(
     memory_dir: Path,
+    ignore_globs: list | None = None,
 ) -> list[Issue]:
     """Find broken references to files and cross-refs that don't exist.
 
-    No heavy dependencies — pure filesystem + regex.
+    Each Issue's details include `line` (1-based source line of the broken ref)
+    so `vigil fix` can point at file+line. No heavy dependencies — pure
+    filesystem + regex.
     """
     issues = []
 
@@ -586,6 +665,8 @@ def find_orphans(
 
     for f in sorted(memory_dir.glob('*.md')):
         if f.name in ('MEMORY.md', 'README.md'):
+            continue
+        if _is_ignored(f, memory_dir, ignore_globs):
             continue
 
         content = f.read_text(encoding='utf-8', errors='replace')
@@ -605,6 +686,7 @@ def find_orphans(
                     details={
                         'missing_path': ref,
                         'context': _line_context(body, match.start()),
+                        'line': _orphan_line_number(content, ref),
                     }
                 ))
 
@@ -615,12 +697,16 @@ def find_orphans(
             ref = match.group(1)
             if not ref.startswith('http'):
                 refs.add(Path(ref).name)
-        for match in WIKILINK_RE.finditer(body):
+        # Skip `[[...]]` inside code spans / fenced blocks — those are illustrative
+        # examples (e.g. docs describing the wiki-link syntax), not real cross-refs.
+        wikilink_body = re.sub(r'```.*?```', ' ', body, flags=re.DOTALL)
+        wikilink_body = re.sub(r'`[^`\n]*`', ' ', wikilink_body)
+        for match in WIKILINK_RE.finditer(wikilink_body):
             slug = match.group(1).strip()
             if slug:
                 refs.add(f'{slug}.md')
 
-        for ref in refs:
+        for ref in sorted(refs):
             stem = ref.replace('.md', '')
             if stem not in memory_stems and ref != f.name:
                 issues.append(Issue(
@@ -628,7 +714,10 @@ def find_orphans(
                     category='orphan',
                     message=f'Memory cross-ref not found: {ref}',
                     files=[f.stem],
-                    details={'missing_ref': ref}
+                    details={
+                        'missing_ref': ref,
+                        'line': _orphan_line_number(content, ref.replace('.md', '')),
+                    }
                 ))
 
     return issues
@@ -654,7 +743,8 @@ def _meta_value(meta: dict, field: str) -> str:
 
 def find_unprovenanced(
     memory_dir: Path,
-    required_fields: set[str] | None = None,
+    required_fields: set[str] | list | None = None,
+    ignore_globs: list | None = None,
 ) -> list[Issue]:
     """Flag memory files missing provenance metadata.
 
@@ -662,15 +752,19 @@ def find_unprovenanced(
     Files without metadata about their origin are untrusted —
     they are facts without provenance, vulnerable to confabulation.
 
-    No heavy dependencies — pure filesystem + frontmatter parsing.
+    `required_fields` may come from VigilConfig (a list) or default to the
+    built-in set. No heavy dependencies — pure filesystem + frontmatter parsing.
     """
     if required_fields is None:
         required_fields = REQUIRED_PROVENANCE
+    required_fields = set(required_fields)
 
     issues = []
 
     for f in sorted(memory_dir.glob('*.md')):
         if f.name in ('MEMORY.md', 'README.md'):
+            continue
+        if _is_ignored(f, memory_dir, ignore_globs):
             continue
 
         content = f.read_text(encoding='utf-8', errors='replace')
@@ -989,13 +1083,25 @@ def full_scan(
     store_dir: Path | None = None,
     checks: list[str] | None = None,
     collection_name: str | None = None,
+    config=None,
+    now: datetime | None = None,
 ) -> dict[str, list[Issue]]:
-    """Run all health checks and return categorized issues."""
+    """Run all health checks and return categorized issues.
+
+    `config` is an optional VigilConfig; when omitted, built-in defaults are
+    loaded from `<memory_dir>/.vigil.toml` (or pure defaults if absent). `now`
+    is threaded into staleness for deterministic snapshots.
+    """
     if store_dir is None:
         store_dir = default_store_dir(memory_dir)
     collection_name = resolve_collection_name(collection_name)
     if checks is None:
         checks = ['duplicates', 'isolated', 'orphans', 'stale', 'provenance', 'contradictions']
+
+    if config is None:
+        from .config import VigilConfig
+        config = VigilConfig.load(memory_dir)
+    ignore = config.ignore_globs
 
     # Compute the shared embedding records + dense similarity matrix ONCE and
     # pass them into the chroma-backed checks, rather than letting each of
@@ -1012,23 +1118,48 @@ def full_scan(
     results = {}
     if 'duplicates' in checks:
         results['duplicates'] = find_duplicates(
-            store_dir, collection_name=collection_name,
+            store_dir, threshold=config.duplicate_threshold,
+            collection_name=collection_name,
             records=records, sim_matrix=sim_matrix)
     if 'isolated' in checks:
         results['isolated'] = find_isolated(
-            store_dir, collection_name=collection_name,
+            store_dir, isolation_threshold=config.isolation_threshold,
+            collection_name=collection_name,
             records=records, sim_matrix=sim_matrix)
     if 'orphans' in checks:
-        results['orphans'] = find_orphans(memory_dir)
+        results['orphans'] = find_orphans(memory_dir, ignore_globs=ignore)
     if 'stale' in checks:
         results['stale'] = find_stale(
-            memory_dir, store_dir=store_dir, collection_name=collection_name)
+            memory_dir, warn_days=config.warn_days,
+            critical_days=config.critical_days,
+            store_dir=store_dir, collection_name=collection_name, now=now,
+            volatility_markers=config.volatility_markers,
+            base_weight=config.staleness_base_weight,
+            content_weight=config.staleness_content_weight,
+            volatility_weight=config.staleness_volatility_weight,
+            ignore_globs=ignore)
     if 'provenance' in checks:
-        results['provenance'] = find_unprovenanced(memory_dir)
+        results['provenance'] = find_unprovenanced(
+            memory_dir, required_fields=config.required_provenance_fields,
+            ignore_globs=ignore)
     if 'contradictions' in checks:
         results['contradictions'] = find_contradictions(
-            store_dir, collection_name=collection_name,
-            records=records, sim_matrix=sim_matrix)
+            store_dir, sim_low=config.sim_low, sim_high=config.sim_high,
+            nli_threshold=config.nli_threshold,
+            collection_name=collection_name,
+            records=records, sim_matrix=sim_matrix, memory_dir=memory_dir)
+
+    # Drop embedding-check issues whose source file matches an ignore glob
+    # (duplicates/isolated/contradictions operate over ChromaDB records keyed by
+    # source_file; filtering issues post-hoc keeps the shared matrix path intact).
+    if ignore:
+        for cat in ('duplicates', 'isolated', 'contradictions'):
+            if cat in results:
+                results[cat] = [
+                    iss for iss in results[cat]
+                    if not any(_is_ignored(memory_dir / f'{f}.md', memory_dir, ignore)
+                               for f in iss.files)
+                ]
     return results
 
 
@@ -1071,6 +1202,9 @@ def format_report(results: dict[str, list[Issue]]) -> str:
             if issue.category in ('contradiction', 'duplicate'):
                 lines.append(f'         A: {issue.details.get("text_a", "")[:120]}')
                 lines.append(f'         B: {issue.details.get("text_b", "")[:120]}')
+                if issue.details.get('suggested_keep'):
+                    lines.append(f'         suggested keep: {issue.details["suggested_keep"]}'
+                                 f' (advisory)')
             elif issue.category == 'stale':
                 m = issue.details.get('markers', [])
                 if m:

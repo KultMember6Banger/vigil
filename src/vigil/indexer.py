@@ -128,7 +128,10 @@ def chunk_text(text: str, source_file: str, meta: dict,
     for i, chunk in enumerate(chunks):
         if len(chunk.strip()) < MIN_CHUNK:
             continue
+        # `type` may be top-level or nested under `metadata:` (Claude Code format).
         mtype = _coerce_str(meta.get('type', ''))
+        if not mtype and isinstance(meta.get('metadata'), dict):
+            mtype = _coerce_str(meta['metadata'].get('type', ''))
         results.append({
             'id': f'{source_file}:{i}',
             'text': chunk,

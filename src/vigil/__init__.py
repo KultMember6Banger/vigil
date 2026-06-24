@@ -6,7 +6,7 @@ orphan references, and missing provenance in markdown-based memory stores.
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from vigil.scanner import (
     Issue,
@@ -23,3 +23,11 @@ from vigil.scanner import (
     full_scan,
     format_report,
 )
+from vigil.config import VigilConfig
+from vigil.history import (
+    record_health_snapshot,
+    load_history,
+    format_history,
+    diff_last_two,
+)
+from vigil.fix import build_plan, apply_plan, run_fix, format_plan
