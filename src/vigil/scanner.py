@@ -17,6 +17,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from . import memcore
 from .indexer import (
     parse_frontmatter, EMBED_MODEL,
     default_store_dir, resolve_collection_name,
@@ -40,11 +41,13 @@ def _load_nli(model_name: str = NLI_MODEL):
     return CrossEncoder(model_name)
 
 
-@functools.lru_cache(maxsize=2)
 def _load_embedder(model_name: str = EMBED_MODEL):
-    """Load (and cache) the sentence-transformer embedding model."""
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(model_name)
+    """Load (and cache) the sentence-transformer embedding model.
+
+    Delegates to the shared core's cached loader. Kept as a module-level name
+    so callers (and tests) can patch `scanner._load_embedder`.
+    """
+    return memcore.load_embedder(model_name)
 
 
 @dataclass
@@ -75,12 +78,12 @@ def _get_all_records(store_dir: Path, collection_name: str | None = None):
 
 
 def _build_sim_matrix(embeddings):
-    """Build cosine similarity matrix from embedding vectors."""
-    import numpy as np
-    emb = np.array(embeddings, dtype=np.float32)
-    norms = np.linalg.norm(emb, axis=1, keepdims=True)
-    normalized = emb / (norms + 1e-8)
-    return normalized @ normalized.T
+    """Build cosine similarity matrix from embedding vectors.
+
+    Thin wrapper over the shared core; kept as a module-level name so tests can
+    reference/patch `scanner._build_sim_matrix`.
+    """
+    return memcore.cosine_matrix(embeddings)
 
 
 def _softmax(x):
@@ -866,7 +869,7 @@ def pre_write_check(
             # 0..1 for these embeddings). The thresholds below are on this
             # corrected cosine scale: skip pairs that are too unrelated to
             # collide (sim < 0.5) or near-identical restatements (sim > 0.92).
-            sim = 1 - distance
+            sim = memcore.sim_from_distance(distance)
 
             if sim < 0.5 or sim > 0.92:
                 continue
