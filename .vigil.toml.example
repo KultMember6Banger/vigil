@@ -1,0 +1,68 @@
+# .vigil.toml — optional Vigil configuration.
+#
+# Place this file (renamed to `.vigil.toml`) in your memory directory, or point
+# at it with `vigil <cmd> --config path/to/.vigil.toml`. Every value is optional
+# and falls back to Vigil's built-in default. Precedence (highest wins):
+#
+#     CLI flags  >  .vigil.toml  >  built-in defaults
+#
+# All keys below are shown with their default values.
+
+# Provenance: which frontmatter fields every memory file must declare.
+required_provenance_fields = ["name", "type", "description"]
+
+# Files to skip in ALL checks. Globs match the file name and the path relative
+# to the memory dir (e.g. "*.draft.md", "scratch/*").
+ignore_globs = []
+
+[contradictions]
+# Same-topic pairs live in the cosine-similarity window [sim_low, sim_high].
+# Below sim_low: unrelated. Above sim_high: restatements, not contradictions.
+sim_low = 0.65
+sim_high = 0.90
+# Minimum NLI contradiction probability to flag a pair.
+nli_threshold = 0.85
+
+[isolated]
+# A file whose best cross-file similarity is below this has no retrieval path.
+isolation_threshold = 0.3
+
+[staleness]
+# A file younger than warn_days is never flagged; critical_days informs severity.
+warn_days = 14
+critical_days = 30
+# Blend weights for the staleness score (base age / content age / volatility).
+base_weight = 0.4
+content_weight = 0.3
+volatility_weight = 0.3
+
+# Volatility markers — each is a regex with a label and a weight. Replacing this
+# list overrides the defaults entirely. Add your own to flag domain-specific
+# churn (e.g. ticket ids, sprint markers).
+[[staleness.volatility_markers]]
+pattern = "\\b(current|currently|ongoing|in.?progress|active)\\b"
+label = "temporal_state"
+weight = 0.3
+[[staleness.volatility_markers]]
+pattern = "\\b(pending|waiting|queued|blocked|next)\\b"
+label = "pending_action"
+weight = 0.2
+[[staleness.volatility_markers]]
+pattern = "\\bstatus:\\s*\\w+"
+label = "explicit_status"
+weight = 0.3
+[[staleness.volatility_markers]]
+pattern = "\\b(todo|TODO|FIXME|HACK|TEMP)\\b"
+label = "action_marker"
+weight = 0.2
+
+[duplicates]
+# Cosine-similarity threshold to flag two files as near-duplicates.
+threshold = 0.85
+
+[fix]
+# Where `vigil fix --apply` moves files. Files are MOVED here, never deleted.
+archive_dir = "archive"
+# `vigil fix` only auto-archives a duplicate when similarity >= this (very
+# conservative). Below it, the duplicate is listed for review only.
+duplicate_threshold = 0.92

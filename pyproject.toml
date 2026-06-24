@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vigil-memory"
-version = "0.2.0"
+version = "0.3.0"
 description = "Memory health monitor for AI agents — detects contradictions, duplicates, staleness, and orphan references"
 readme = "README.md"
 license = "Apache-2.0"
@@ -25,6 +25,10 @@ dependencies = [
     "numpy>=1.24.0",
     "sentence-transformers>=2.2.0",
     "pyyaml>=6.0",
+    # `.vigil.toml` config. tomllib is stdlib on 3.11+; tomli backports it for
+    # 3.10. Vigil also ships a tiny built-in fallback parser, so this is a
+    # convenience, not a hard requirement.
+    "tomli>=2.0.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
