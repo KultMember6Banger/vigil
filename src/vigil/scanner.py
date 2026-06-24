@@ -556,7 +556,7 @@ def find_stale(
                 'markers': markers,
                 'access_count': access_count,
                 'retention': round(retention, 3),
-                'type': _coerce_str(parse_frontmatter(content)[0].get('type', '')) or 'unknown',
+                'type': _meta_value(parse_frontmatter(content)[0], 'type') or 'unknown',
             }
         ))
 
@@ -577,6 +577,9 @@ def find_orphans(
     FILE_PATH_RE = re.compile(r'(?:~/|/home/)[^\s\n\r\|`\'">\)]+')
     MEMORY_REF_RE = re.compile(r'`([a-z][a-z0-9_]+\.md)`')
     LINK_RE = re.compile(r'\[.*?\]\(([^)]+\.md)\)')
+    # `[[slug]]` wiki-links — the cross-ref convention used by Claude Code memory,
+    # where the slug is another memory file's stem (its `name:`).
+    WIKILINK_RE = re.compile(r'\[\[([^\]|]+?)\]\]')
     SKIP_PATH = re.compile(r'[<>{}*?]|YYYY|MM-DD|\$\(')
 
     memory_stems = {f.stem for f in memory_dir.glob('*.md')}
@@ -612,6 +615,10 @@ def find_orphans(
             ref = match.group(1)
             if not ref.startswith('http'):
                 refs.add(Path(ref).name)
+        for match in WIKILINK_RE.finditer(body):
+            slug = match.group(1).strip()
+            if slug:
+                refs.add(f'{slug}.md')
 
         for ref in refs:
             stem = ref.replace('.md', '')
@@ -630,6 +637,19 @@ def find_orphans(
 # --- 4b. Provenance Check (Source Monitoring) ---
 
 REQUIRED_PROVENANCE = {'name', 'type', 'description'}
+
+
+def _meta_value(meta: dict, field: str) -> str:
+    """Resolve a provenance field from top-level frontmatter, falling back to a
+    nested `metadata:` mapping. Claude Code's memory format nests `type` (and
+    friends) under `metadata:`, so a flat-only lookup yields false 'missing' flags.
+    """
+    val = _coerce_str(meta.get(field, '')).strip()
+    if not val:
+        nested = meta.get('metadata')
+        if isinstance(nested, dict):
+            val = _coerce_str(nested.get(field, '')).strip()
+    return val
 
 
 def find_unprovenanced(
@@ -658,10 +678,9 @@ def find_unprovenanced(
 
         missing = []
         for field in sorted(required_fields):
-            # meta values may be non-strings (lists/ints/bools) after pyyaml
-            # parsing — coerce before checking emptiness.
-            val = _coerce_str(meta.get(field, '')).strip()
-            if not val:
+            # Resolve from top-level OR a nested `metadata:` mapping; values may be
+            # non-strings (lists/ints/bools) after pyyaml parsing — coerced inside.
+            if not _meta_value(meta, field):
                 missing.append(field)
 
         if missing:
