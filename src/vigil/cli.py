@@ -7,7 +7,12 @@ Usage:
   vigil check  <memory_dir> "new text"   # Pre-write contradiction check
   vigil check  <memory_dir> --file x.md  # Check file contents
   vigil health <memory_dir>              # Full scan + update health scores
+
+Store dir resolves to --store, else $MEMORY_STORE, else <memory_dir>/.vigil/.
+Collection resolves to --collection, else $MEMORY_COLLECTION, else 'agent_memory'.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -16,16 +21,23 @@ import time
 from pathlib import Path
 
 
+def _resolve_store(args, memory_dir):
+    """--store override, else env-aware default (MEMORY_STORE / .vigil)."""
+    from .indexer import default_store_dir
+    return Path(args.store) if args.store else default_store_dir(memory_dir)
+
+
 def cmd_index(args):
-    from .indexer import build_index
+    from .indexer import build_index, default_store_dir
 
     memory_dir = Path(args.memory_dir)
-    store_dir = Path(args.store) if args.store else None
+    store_dir = Path(args.store) if args.store else default_store_dir(memory_dir)
 
     print(f'Vigil indexing {memory_dir}...')
     stats = build_index(
         memory_dir, store_dir=store_dir,
         full_rebuild=args.rebuild,
+        collection_name=args.collection,
     )
     print(f'  Indexed: {stats["indexed"]} files'
           f' (skipped {stats["skipped"]} unchanged)')
@@ -34,11 +46,15 @@ def cmd_index(args):
 
 
 def cmd_scan(args):
-    from .scanner import full_scan, format_report
-    from .indexer import default_store_dir
+    from .scanner import (
+        format_report, find_duplicates, find_isolated, find_orphans,
+        find_stale, find_unprovenanced, find_contradictions,
+        _get_all_records, _build_sim_matrix,
+    )
 
     memory_dir = Path(args.memory_dir)
-    store_dir = Path(args.store) if args.store else default_store_dir(memory_dir)
+    store_dir = _resolve_store(args, memory_dir)
+    coll = args.collection
 
     checks = args.checks or ['duplicates', 'isolated', 'orphans', 'stale', 'provenance', 'contradictions']
 
@@ -48,37 +64,43 @@ def cmd_scan(args):
     step = 0
     total_steps = len(checks)
 
+    # Read embeddings + build the similarity matrix once, shared across the
+    # chroma-backed checks (avoids 3x redundant Chroma reads / matrix rebuilds).
+    records = None
+    sim_matrix = None
+    if any(c in checks for c in ('duplicates', 'isolated', 'contradictions')):
+        records = _get_all_records(store_dir, coll)
+        if records and records.get('ids'):
+            sim_matrix = _build_sim_matrix(records['embeddings'])
+
     results = {}
     if 'duplicates' in checks:
         step += 1
         print(f'  [{step}/{total_steps}] Duplicates...')
-        from .scanner import find_duplicates
-        results['duplicates'] = find_duplicates(store_dir)
+        results['duplicates'] = find_duplicates(
+            store_dir, collection_name=coll, records=records, sim_matrix=sim_matrix)
     if 'isolated' in checks:
         step += 1
         print(f'  [{step}/{total_steps}] Isolated entries...')
-        from .scanner import find_isolated
-        results['isolated'] = find_isolated(store_dir)
+        results['isolated'] = find_isolated(
+            store_dir, collection_name=coll, records=records, sim_matrix=sim_matrix)
     if 'orphans' in checks:
         step += 1
         print(f'  [{step}/{total_steps}] Orphans...')
-        from .scanner import find_orphans
         results['orphans'] = find_orphans(memory_dir)
     if 'stale' in checks:
         step += 1
         print(f'  [{step}/{total_steps}] Staleness...')
-        from .scanner import find_stale
-        results['stale'] = find_stale(memory_dir, store_dir=store_dir)
+        results['stale'] = find_stale(memory_dir, store_dir=store_dir, collection_name=coll)
     if 'provenance' in checks:
         step += 1
         print(f'  [{step}/{total_steps}] Provenance...')
-        from .scanner import find_unprovenanced
         results['provenance'] = find_unprovenanced(memory_dir)
     if 'contradictions' in checks:
         step += 1
         print(f'  [{step}/{total_steps}] Contradictions (NLI model)...')
-        from .scanner import find_contradictions
-        results['contradictions'] = find_contradictions(store_dir)
+        results['contradictions'] = find_contradictions(
+            store_dir, collection_name=coll, records=records, sim_matrix=sim_matrix)
 
     elapsed = time.time() - t0
 
@@ -97,10 +119,9 @@ def cmd_scan(args):
 
 def cmd_check(args):
     from .scanner import pre_write_check
-    from .indexer import default_store_dir
 
     memory_dir = Path(args.memory_dir)
-    store_dir = Path(args.store) if args.store else default_store_dir(memory_dir)
+    store_dir = _resolve_store(args, memory_dir)
 
     if args.file:
         text = Path(args.file).read_text(encoding='utf-8')
@@ -114,7 +135,8 @@ def cmd_check(args):
 
     print('Vigil pre-write check...')
     t0 = time.time()
-    issues = pre_write_check(text, store_dir=store_dir, source_file=source)
+    issues = pre_write_check(text, store_dir=store_dir, source_file=source,
+                             collection_name=args.collection)
     elapsed = time.time() - t0
 
     if not issues:
@@ -132,17 +154,17 @@ def cmd_check(args):
 
 def cmd_health(args):
     from .scanner import full_scan, compute_health_scores, update_health_scores
-    from .indexer import default_store_dir
 
     memory_dir = Path(args.memory_dir)
-    store_dir = Path(args.store) if args.store else default_store_dir(memory_dir)
+    store_dir = _resolve_store(args, memory_dir)
+    coll = args.collection
 
     print('Vigil health scan + score update...')
     t0 = time.time()
 
-    results = full_scan(memory_dir=memory_dir, store_dir=store_dir)
+    results = full_scan(memory_dir=memory_dir, store_dir=store_dir, collection_name=coll)
     scores = compute_health_scores(results)
-    n = update_health_scores(scores, store_dir)
+    n = update_health_scores(scores, store_dir, collection_name=coll)
 
     elapsed = time.time() - t0
     total_issues = sum(len(v) for v in results.values())
@@ -171,10 +193,15 @@ def main():
     )
     sub = parser.add_subparsers(dest='command', help='Commands')
 
+    coll_help = ('ChromaDB collection name (default: $MEMORY_COLLECTION '
+                 "or 'agent_memory')")
+    store_help = 'ChromaDB store path (default: $MEMORY_STORE or <memory_dir>/.vigil/)'
+
     # index
     p_idx = sub.add_parser('index', help='Build/update search index')
     p_idx.add_argument('memory_dir', help='Directory of markdown memory files')
-    p_idx.add_argument('--store', help='ChromaDB store path (default: <memory_dir>/.vigil/)')
+    p_idx.add_argument('--store', help=store_help)
+    p_idx.add_argument('--collection', help=coll_help)
     p_idx.add_argument('--rebuild', action='store_true', help='Full rebuild (delete existing index)')
 
     # scan
@@ -184,7 +211,8 @@ def main():
                         choices=['contradictions', 'duplicates', 'isolated', 'stale', 'orphans', 'provenance'],
                         action='append', dest='checks')
     p_scan.add_argument('--json', action='store_true', help='Output as JSON')
-    p_scan.add_argument('--store', help='ChromaDB store path')
+    p_scan.add_argument('--store', help=store_help)
+    p_scan.add_argument('--collection', help=coll_help)
 
     # check (pre-write)
     p_check = sub.add_parser('check', help='Pre-write contradiction check')
@@ -192,12 +220,14 @@ def main():
     p_check.add_argument('text', nargs='?', help='Text to check')
     p_check.add_argument('--file', help='Read text from file instead')
     p_check.add_argument('--source', default='', help='Source file stem to exclude')
-    p_check.add_argument('--store', help='ChromaDB store path')
+    p_check.add_argument('--store', help=store_help)
+    p_check.add_argument('--collection', help=coll_help)
 
     # health
     p_health = sub.add_parser('health', help='Full scan + update health scores')
     p_health.add_argument('memory_dir', help='Directory of markdown memory files')
-    p_health.add_argument('--store', help='ChromaDB store path')
+    p_health.add_argument('--store', help=store_help)
+    p_health.add_argument('--collection', help=coll_help)
 
     args = parser.parse_args()
 

@@ -2,6 +2,10 @@
 
 Memory health monitor for AI agents. Detects contradictions, duplicates, staleness, and orphan references in markdown-based memory stores.
 
+**v0.2.0** — configurable store/collection (`--store` / `--collection`,
+`MEMORY_STORE` / `MEMORY_COLLECTION`), Steno-shared `agent_memory` default,
+an MCP server, PyYAML frontmatter parsing, and corrected cosine/staleness math.
+
 ## The problem
 
 AI agents with persistent memory accumulate drift over time. Memories contradict each other. Stale facts linger. References break. Duplicates waste context. No existing tool audits memory health after the fact — Vigil is the first.
@@ -92,6 +96,82 @@ The actual memory content goes here.
 
 If no frontmatter is present, the entire file is treated as content.
 
+Frontmatter is parsed with PyYAML, so nested values, lists, and multiline
+strings are supported. Non-string metadata values are coerced where checks
+expect strings.
+
+## Store & collection configuration
+
+Every command resolves its ChromaDB **store directory** and **collection name**
+the same way:
+
+| Setting | `--flag` | Env var | Default |
+|---------|----------|---------|---------|
+| Store dir | `--store <path>` | `MEMORY_STORE` | `<memory_dir>/.vigil/` |
+| Collection | `--collection <name>` | `MEMORY_COLLECTION` | `agent_memory` |
+
+Precedence is flag > env var > default. The shared default collection name
+(`agent_memory`) lets Vigil audit the same store another tool indexes into.
+
+## Steno integration
+
+[Steno](https://github.com/KultMember6Banger/steno) indexes memory into the
+same ChromaDB. Point both at one store + collection and Vigil scores exactly
+what Steno built:
+
+```bash
+# Steno builds the index...
+steno index ./memory/ --store ./shared --collection agent_memory
+
+# ...Vigil audits and scores the very same records:
+vigil health ./memory/ --store ./shared --collection agent_memory
+```
+
+Or set it once via env vars so every command agrees:
+
+```bash
+export MEMORY_STORE=./shared
+export MEMORY_COLLECTION=agent_memory
+vigil scan ./memory/
+```
+
+Vigil reads `access_count` / `last_accessed` from each record's metadata and
+writes back `health_score`. Steno's retrieval applies `final_score =
+similarity * health_score` automatically.
+
+## MCP server
+
+Vigil ships a stdio JSON-RPC **MCP server** (protocol `2024-11-05`) exposing
+its checks as native AI-agent tools, installed as the `vigil-mcp` console
+script (module: `mcp_server.py`).
+
+Tools:
+
+| Tool | Purpose |
+|------|---------|
+| `vigil_scan` | Run a full or selective health scan → issues as JSON |
+| `vigil_check` | Pre-write contradiction gate for proposed new text → conflicts |
+| `vigil_health` | Full scan + write updated health scores into ChromaDB |
+
+Each tool accepts `memory_dir` (and optional `store` / `collection`) and
+returns `{"content": [{"type": "text", "text": <json>}]}`.
+
+Example MCP client config (Claude Desktop / Claude Code):
+
+```json
+{
+  "mcpServers": {
+    "vigil": {
+      "command": "vigil-mcp",
+      "env": { "MEMORY_STORE": "./shared", "MEMORY_COLLECTION": "agent_memory" }
+    }
+  }
+}
+```
+
+Without the console script, run it directly: `python mcp_server.py` (ensure the
+`vigil` package is importable, e.g. `PYTHONPATH=src`).
+
 ## CLI reference
 
 ### `vigil index <memory_dir>`
@@ -100,7 +180,8 @@ Build or update the ChromaDB search index.
 
 | Flag | Description |
 |------|-------------|
-| `--store <path>` | Custom ChromaDB location (default: `<memory_dir>/.vigil/`) |
+| `--store <path>` | Custom ChromaDB location (default: `$MEMORY_STORE` or `<memory_dir>/.vigil/`) |
+| `--collection <name>` | Collection name (default: `$MEMORY_COLLECTION` or `agent_memory`) |
 | `--rebuild` | Delete and rebuild entire index |
 
 ### `vigil scan <memory_dir>`
@@ -111,7 +192,8 @@ Run health checks.
 |------|-------------|
 | `--check <type>` | Run specific check(s): `contradictions`, `duplicates`, `isolated`, `stale`, `orphans`, `provenance` |
 | `--json` | Output as JSON |
-| `--store <path>` | Custom ChromaDB location |
+| `--store <path>` | Custom ChromaDB location (default: `$MEMORY_STORE` or `<memory_dir>/.vigil/`) |
+| `--collection <name>` | Collection name (default: `$MEMORY_COLLECTION` or `agent_memory`) |
 
 ### `vigil check <memory_dir> "text"`
 
@@ -121,11 +203,13 @@ Pre-write contradiction check.
 |------|-------------|
 | `--file <path>` | Read text from file instead of argument |
 | `--source <stem>` | Exclude this file from comparison |
-| `--store <path>` | Custom ChromaDB location |
+| `--store <path>` | Custom ChromaDB location (default: `$MEMORY_STORE` or `<memory_dir>/.vigil/`) |
+| `--collection <name>` | Collection name (default: `$MEMORY_COLLECTION` or `agent_memory`) |
 
 ### `vigil health <memory_dir>`
 
-Full scan + write health scores to ChromaDB.
+Full scan + write health scores to ChromaDB. Honors `--store` / `--collection`
+(and `MEMORY_STORE` / `MEMORY_COLLECTION`) like the other commands.
 
 ## Python API
 
@@ -170,6 +254,10 @@ for issue in issues:
 - Python 3.10+
 - `chromadb >= 0.4.0`
 - `sentence-transformers >= 2.2.0`
+- `pyyaml >= 6.0`
+
+The lightweight checks (stale / orphans / provenance) and the package import
+need only `pyyaml`; the vector checks add `chromadb` + `sentence-transformers`.
 
 Models are downloaded automatically on first use:
 - `all-MiniLM-L6-v2` (~80MB) — embeddings

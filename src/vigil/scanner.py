@@ -8,18 +8,42 @@ inside functions that need them. find_stale() and find_orphans() work
 with only the standard library + the indexer's frontmatter parser.
 """
 
+from __future__ import annotations
+
+import functools
 import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from .indexer import (
-    parse_frontmatter, COLLECTION_NAME, EMBED_MODEL,
-    default_store_dir,
+    parse_frontmatter, EMBED_MODEL,
+    default_store_dir, resolve_collection_name,
+    _coerce_str,
 )
 
 # NLI model for contradiction detection
 NLI_MODEL = 'cross-encoder/nli-deberta-v3-xsmall'
+
+
+# --- Cached model loaders ---
+# Loading a CrossEncoder / SentenceTransformer is expensive (model weights +
+# tokenizer). Cache by model name so repeated calls within a process reuse a
+# single loaded instance instead of reloading on every find_contradictions /
+# pre_write_check invocation.
+
+@functools.lru_cache(maxsize=2)
+def _load_nli(model_name: str = NLI_MODEL):
+    """Load (and cache) the NLI cross-encoder."""
+    from sentence_transformers import CrossEncoder
+    return CrossEncoder(model_name)
+
+
+@functools.lru_cache(maxsize=2)
+def _load_embedder(model_name: str = EMBED_MODEL):
+    """Load (and cache) the sentence-transformer embedding model."""
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(model_name)
 
 
 @dataclass
@@ -34,11 +58,12 @@ class Issue:
 
 # --- Shared utilities ---
 
-def _get_all_records(store_dir: Path):
+def _get_all_records(store_dir: Path, collection_name: str | None = None):
     """Pull all records from ChromaDB with embeddings."""
     import chromadb
+    collection_name = resolve_collection_name(collection_name)
     client = chromadb.PersistentClient(path=str(store_dir))
-    collection = client.get_collection(COLLECTION_NAME)
+    collection = client.get_collection(collection_name)
     count = collection.count()
     if count == 0:
         return None
@@ -121,28 +146,36 @@ def find_contradictions(
     sim_low: float = 0.65,
     sim_high: float = 0.90,
     nli_threshold: float = 0.85,
+    collection_name: str | None = None,
+    records=None,
+    sim_matrix=None,
 ) -> list[Issue]:
     """Find memory pairs that contradict each other.
 
     Uses pairwise cosine similarity to find same-topic pairs, then
     NLI cross-encoder to classify as contradiction/entailment/neutral.
     Entity overlap filter reduces false positives.
+
+    `records` and `sim_matrix` may be supplied by full_scan to avoid
+    re-reading embeddings and rebuilding the dense NxN matrix; they are
+    computed internally when omitted (standalone use).
     """
     import numpy as np
 
-    records = _get_all_records(store_dir)
+    if records is None:
+        records = _get_all_records(store_dir, collection_name)
     if not records or not records['ids']:
         return []
 
     try:
-        from sentence_transformers import CrossEncoder
-        nli = CrossEncoder(NLI_MODEL)
+        nli = _load_nli(NLI_MODEL)
     except Exception as e:
         print(f'  WARN: NLI model unavailable ({e}), skipping contradictions')
         return []
 
     n = len(records['ids'])
-    sim_matrix = _build_sim_matrix(records['embeddings'])
+    if sim_matrix is None:
+        sim_matrix = _build_sim_matrix(records['embeddings'])
 
     candidates = []
     seen = set()
@@ -222,14 +255,23 @@ def find_contradictions(
 def find_duplicates(
     store_dir: Path,
     threshold: float = 0.85,
+    collection_name: str | None = None,
+    records=None,
+    sim_matrix=None,
 ) -> list[Issue]:
-    """Find near-duplicate memories across different files."""
-    records = _get_all_records(store_dir)
+    """Find near-duplicate memories across different files.
+
+    `records`/`sim_matrix` may be supplied to avoid redundant Chroma reads
+    and matrix rebuilds; computed internally when omitted.
+    """
+    if records is None:
+        records = _get_all_records(store_dir, collection_name)
     if not records or not records['ids']:
         return []
 
     n = len(records['ids'])
-    sim_matrix = _build_sim_matrix(records['embeddings'])
+    if sim_matrix is None:
+        sim_matrix = _build_sim_matrix(records['embeddings'])
 
     issues = []
     seen = set()
@@ -272,6 +314,9 @@ def find_duplicates(
 def find_isolated(
     store_dir: Path,
     isolation_threshold: float = 0.3,
+    collection_name: str | None = None,
+    records=None,
+    sim_matrix=None,
 ) -> list[Issue]:
     """Find memory entries with no semantic neighbors.
 
@@ -280,19 +325,20 @@ def find_isolated(
     max similarity to any other entry is below the threshold has no
     retrieval path and is effectively dead.
 
-    Requires ChromaDB + embeddings.
+    Requires ChromaDB + embeddings. `records`/`sim_matrix` may be supplied
+    to avoid redundant Chroma reads and matrix rebuilds.
     """
-    records = _get_all_records(store_dir)
+    if records is None:
+        records = _get_all_records(store_dir, collection_name)
     if not records or not records['ids']:
         return []
-
-    import numpy as np
 
     n = len(records['ids'])
     if n < 2:
         return []
 
-    sim_matrix = _build_sim_matrix(records['embeddings'])
+    if sim_matrix is None:
+        sim_matrix = _build_sim_matrix(records['embeddings'])
 
     # Per-file: best similarity to any chunk from a DIFFERENT file
     file_best_sim = {}
@@ -345,7 +391,7 @@ def _ebbinghaus_retention(age_days: float, strength: float = 1.0) -> float:
     return math.exp(-age_days / max(strength * 30, 1))
 
 
-def _get_access_data(store_dir: Path) -> dict[str, dict]:
+def _get_access_data(store_dir: Path, collection_name: str | None = None) -> dict[str, dict]:
     """Pull access_count and last_accessed from ChromaDB metadata.
 
     Returns {source_file: {access_count, last_accessed, ...}} aggregated
@@ -353,8 +399,9 @@ def _get_access_data(store_dir: Path) -> dict[str, dict]:
     """
     try:
         import chromadb
+        collection_name = resolve_collection_name(collection_name)
         client = chromadb.PersistentClient(path=str(store_dir))
-        collection = client.get_collection(COLLECTION_NAME)
+        collection = client.get_collection(collection_name)
         count = collection.count()
         if count == 0:
             return {}
@@ -383,6 +430,7 @@ def find_stale(
     warn_days: int = 14,
     critical_days: int = 30,
     store_dir: Path | None = None,
+    collection_name: str | None = None,
 ) -> list[Issue]:
     """Score memories for staleness using Ebbinghaus-informed decay.
 
@@ -403,7 +451,7 @@ def find_stale(
     # Pull access data if ChromaDB available
     access_data = {}
     if store_dir is not None:
-        access_data = _get_access_data(store_dir)
+        access_data = _get_access_data(store_dir, collection_name)
 
     VOLATILE = [
         (r'\b(current|currently|ongoing|in.?progress|active)\b', 'temporal_state', 0.3),
@@ -485,7 +533,10 @@ def find_stale(
         if staleness < 0.5:
             continue
 
-        severity = 'CRITICAL' if staleness > 1.0 else 'WARNING'
+        # staleness is a weighted blend (base*0.4 + content*0.3 + vol*0.3) that
+        # maxes at 1.0, so the old `> 1.0` threshold meant CRITICAL never fired.
+        # Trigger CRITICAL meaningfully at the high end of the scale.
+        severity = 'CRITICAL' if staleness > 0.75 else 'WARNING'
         msg = f'Staleness {staleness:.2f} (eff_age: {effective_age}d, content: {content_age}d'
         if access_count > 0:
             msg += f', accessed: {access_count}x'
@@ -505,7 +556,7 @@ def find_stale(
                 'markers': markers,
                 'access_count': access_count,
                 'retention': round(retention, 3),
-                'type': parse_frontmatter(content)[0].get('type', 'unknown'),
+                'type': _coerce_str(parse_frontmatter(content)[0].get('type', '')) or 'unknown',
             }
         ))
 
@@ -607,7 +658,9 @@ def find_unprovenanced(
 
         missing = []
         for field in sorted(required_fields):
-            val = meta.get(field, '').strip()
+            # meta values may be non-strings (lists/ints/bools) after pyyaml
+            # parsing — coerce before checking emptiness.
+            val = _coerce_str(meta.get(field, '')).strip()
             if not val:
                 missing.append(field)
 
@@ -636,6 +689,7 @@ def pre_write_check(
     source_file: str = '',
     top_k: int = 5,
     nli_threshold: float = 0.7,
+    collection_name: str | None = None,
 ) -> list[Issue]:
     """Check if new text contradicts existing memories BEFORE writing.
 
@@ -647,22 +701,21 @@ def pre_write_check(
 
     import numpy as np
     import chromadb
-    from sentence_transformers import SentenceTransformer
 
+    collection_name = resolve_collection_name(collection_name)
     client = chromadb.PersistentClient(path=str(store_dir))
     try:
-        collection = client.get_collection(COLLECTION_NAME)
+        collection = client.get_collection(collection_name)
     except Exception:
         return []
 
     if collection.count() == 0:
         return []
 
-    model = SentenceTransformer(EMBED_MODEL)
+    model = _load_embedder(EMBED_MODEL)
 
     try:
-        from sentence_transformers import CrossEncoder
-        nli = CrossEncoder(NLI_MODEL)
+        nli = _load_nli(NLI_MODEL)
     except Exception:
         return []
 
@@ -695,7 +748,12 @@ def pre_write_check(
 
         for j in range(len(results['ids'][0])):
             distance = results['distances'][0][j]
-            sim = 1 - (distance / 2)
+            # Chroma 'cosine' space: distance = 1 - cosine_similarity, so the
+            # correct recovery is sim = 1 - distance (range -1..1, typically
+            # 0..1 for these embeddings). The thresholds below are on this
+            # corrected cosine scale: skip pairs that are too unrelated to
+            # collide (sim < 0.5) or near-identical restatements (sim > 0.92).
+            sim = 1 - distance
 
             if sim < 0.5 or sim > 0.92:
                 continue
@@ -769,6 +827,7 @@ def apply_supersession_decay(
     issues: list[Issue],
     store_dir: Path,
     decay_factor: float = 0.7,
+    collection_name: str | None = None,
 ) -> int:
     """Decay health scores for superseded entries.
 
@@ -785,9 +844,10 @@ def apply_supersession_decay(
         return 0
 
     import chromadb
+    collection_name = resolve_collection_name(collection_name)
     client = chromadb.PersistentClient(path=str(store_dir))
     try:
-        collection = client.get_collection(COLLECTION_NAME)
+        collection = client.get_collection(collection_name)
     except Exception:
         return 0
 
@@ -858,6 +918,7 @@ def compute_health_scores(results: dict[str, list[Issue]]) -> dict[str, float]:
 def update_health_scores(
     scores: dict[str, float],
     store_dir: Path,
+    collection_name: str | None = None,
 ) -> int:
     """Write health scores into ChromaDB metadata.
 
@@ -865,9 +926,10 @@ def update_health_scores(
         final_score = semantic_similarity * health_score
     """
     import chromadb
+    collection_name = resolve_collection_name(collection_name)
     client = chromadb.PersistentClient(path=str(store_dir))
     try:
-        collection = client.get_collection(COLLECTION_NAME)
+        collection = client.get_collection(collection_name)
     except Exception:
         return 0
 
@@ -907,26 +969,47 @@ def full_scan(
     memory_dir: Path,
     store_dir: Path | None = None,
     checks: list[str] | None = None,
+    collection_name: str | None = None,
 ) -> dict[str, list[Issue]]:
     """Run all health checks and return categorized issues."""
     if store_dir is None:
         store_dir = default_store_dir(memory_dir)
+    collection_name = resolve_collection_name(collection_name)
     if checks is None:
         checks = ['duplicates', 'isolated', 'orphans', 'stale', 'provenance', 'contradictions']
 
+    # Compute the shared embedding records + dense similarity matrix ONCE and
+    # pass them into the chroma-backed checks, rather than letting each of
+    # find_duplicates / find_isolated / find_contradictions independently
+    # re-read all embeddings and rebuild the NxN matrix (3x redundant work).
+    records = None
+    sim_matrix = None
+    if any(c in checks for c in ('duplicates', 'isolated', 'contradictions')):
+        records = _get_all_records(store_dir, collection_name)
+        if records and records.get('ids') and records.get('embeddings') is not None \
+                and len(records['ids']) > 0:
+            sim_matrix = _build_sim_matrix(records['embeddings'])
+
     results = {}
     if 'duplicates' in checks:
-        results['duplicates'] = find_duplicates(store_dir)
+        results['duplicates'] = find_duplicates(
+            store_dir, collection_name=collection_name,
+            records=records, sim_matrix=sim_matrix)
     if 'isolated' in checks:
-        results['isolated'] = find_isolated(store_dir)
+        results['isolated'] = find_isolated(
+            store_dir, collection_name=collection_name,
+            records=records, sim_matrix=sim_matrix)
     if 'orphans' in checks:
         results['orphans'] = find_orphans(memory_dir)
     if 'stale' in checks:
-        results['stale'] = find_stale(memory_dir, store_dir=store_dir)
+        results['stale'] = find_stale(
+            memory_dir, store_dir=store_dir, collection_name=collection_name)
     if 'provenance' in checks:
         results['provenance'] = find_unprovenanced(memory_dir)
     if 'contradictions' in checks:
-        results['contradictions'] = find_contradictions(store_dir)
+        results['contradictions'] = find_contradictions(
+            store_dir, collection_name=collection_name,
+            records=records, sim_matrix=sim_matrix)
     return results
 
 
