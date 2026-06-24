@@ -138,3 +138,16 @@ if __name__ == "__main__":
     test_compute_health_scores()
     test_format_report()
     print("\nAll tests passed.")
+
+
+def test_wikilink_in_code_not_orphan():
+    # `[[...]]` inside code spans / fences are examples, not real cross-refs.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        d = Path(tmpdir)
+        _write_memory(d, "doc.md", "---\nname: D\ntype: project\ndescription: x\n---\n"
+                      "The `[[wikilink]]` syntax is an example.\n\n```\nsee [[slug]] here\n```\n\nBut [[real]] is a live ref.")
+        _write_memory(d, "real.md", "---\nname: R\ntype: project\ndescription: y\n---\nBody.")
+        msgs = [i.message for i in find_orphans(d)]
+        assert not any("wikilink" in m or "slug" in m for m in msgs), f"code-span examples must not flag: {msgs}"
+        # (and a genuinely broken live wiki-link would still flag — 'real' exists so it's clean)
+        assert not any("real" in m for m in msgs), f"valid [[real]] must not flag: {msgs}"
